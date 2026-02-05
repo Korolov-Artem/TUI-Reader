@@ -129,18 +129,32 @@ func extractText(readableData io.Reader) string {
 }
 
 func handleNavigation(reader *bufio.Reader, currentIndex *int, totalChapters int) {
-	input, _ := reader.ReadString('\n')
-	input = strings.TrimSpace(input)
+	fd := int(os.Stdin.Fd())
 
-	switch input {
-	case "n":
-		*currentIndex++
-	case "p":
-		*currentIndex--
-	case "q":
-		os.Exit(0)
+	oldState, err := term.MakeRaw(fd)
+	if err != nil {
+		panic(err)
 	}
+	defer term.Restore(fd, oldState)
 
+	bytes := make([]byte, 1)
+	os.Stdin.Read(bytes)
+
+	switch bytes[0] {
+	case 'q':
+		term.Restore(fd, oldState)
+		os.Exit(0)
+		return
+	case 27:
+		sequence := make([]byte, 2)
+		os.Stdin.Read(sequence)
+		switch sequence[1] {
+		case 'C':
+			*currentIndex++
+		case 'D':
+			*currentIndex--
+		}
+	}
 	if *currentIndex >= totalChapters {
 		*currentIndex = totalChapters - 1
 	}
@@ -174,6 +188,14 @@ func createReaderStyles() (docStyle, textStyle lipgloss.Style, totalHeight, tota
 }
 
 func viewChapter(totalHeight, totalWidth int, textStyle, docStyle lipgloss.Style, formattedText string, reader *bufio.Reader, currentIndex *int, spine []epub.Itemref) {
+	fd := int(os.Stdin.Fd())
+
+	oldState, err := term.MakeRaw(fd)
+	if err != nil {
+		panic(err)
+	}
+	defer term.Restore(fd, oldState)
+
 	verticalMargin := 7
 	linesPerPage := totalHeight - verticalMargin
 	if linesPerPage < 1 {
@@ -213,40 +235,49 @@ func viewChapter(totalHeight, totalWidth int, textStyle, docStyle lipgloss.Style
 
 		fmt.Print("\033[H\033[2J")
 
-		fmt.Println(pageStyle.Render(pageContent))
+		output := pageStyle.Render(pageContent)
+		output = strings.ReplaceAll(output, "\n", "\r\n")
+		fmt.Print(output)
 
 		linesPrinted := endLine - startLine
 		if linesPrinted < linesPerPage {
-			fmt.Print(strings.Repeat("\n", linesPerPage-linesPrinted))
+			fmt.Print(strings.Repeat("\r\n", linesPerPage-linesPrinted))
 		}
 
-		status := fmt.Sprintf("\nPage %d/%d | Chapter %d/%d", currentPage+1, totalPages, *currentIndex+1, len(spine))
-		fmt.Println(docStyle.Render(status))
+		status := fmt.Sprintf("Page %d/%d | Chapter %d/%d", currentPage+1, totalPages, *currentIndex+1, len(spine))
+		statusRendered := docStyle.Render(status)
+		statusRendered = strings.ReplaceAll(statusRendered, "\n", "\r\n")
+		fmt.Print("\r\n" + statusRendered + "\r\n")
 		//footerText := "[ (n) Next Pg | (p) Prev Pg | (q) Quit ]"
 		//fmt.Println(docStyle.Render(footerText))
 
-		input, _ := reader.ReadString('\n')
-		input = strings.TrimSpace(input)
+		bytes := make([]byte, 1)
+		os.Stdin.Read(bytes)
 
-		switch input {
-		case "n":
-			if currentPage < totalPages-1 {
-				currentPage++
-			} else {
-				*currentIndex++
-				return
-			}
-		case "p":
-			if currentPage > 0 {
-				currentPage--
-			} else {
-				*currentIndex--
-				return
-			}
-		case "q":
+		switch bytes[0] {
+		case 'q':
+			term.Restore(fd, oldState)
 			os.Exit(0)
-		default:
-			fmt.Println("Invalid input")
+			return
+		case 27:
+			sequence := make([]byte, 2)
+			os.Stdin.Read(sequence)
+			switch sequence[1] {
+			case 'C':
+				if currentPage < totalPages-1 {
+					currentPage++
+				} else {
+					*currentIndex++
+					return
+				}
+			case 'D':
+				if currentPage > 0 {
+					currentPage--
+				} else {
+					*currentIndex--
+					return
+				}
+			}
 		}
 	}
 }
