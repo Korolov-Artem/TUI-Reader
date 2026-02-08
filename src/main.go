@@ -1,283 +1,83 @@
 package main
 
 import (
-	zip2 "archive/zip"
-	"bufio"
-	"encoding/xml"
 	"fmt"
-	"io"
 	"os"
-	"strings"
 
-	"github.com/charmbracelet/lipgloss"
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/taylorskalyo/goreader/epub"
-	"golang.org/x/term"
 )
 
+type sessionState int
+
+const (
+	libraryView sessionState = iota
+	readerView
+)
+
+type model struct {
+	state sessionState
+
+	files  []string
+	cursor int
+
+	currentBook *epub.Rootfile
+	spine       []epub.Itemref
+	chapterIdx  int
+	pageIdx     int
+
+	currentText string
+	totalPages  int
+
+	width  int
+	height int
+}
+
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Println("Please provide an epub filename")
-		return
+	initialModel := model{
+		state: libraryView,
+		files: findEpubFiles(),
 	}
-	filename := os.Args[1]
 
-	rc, err := epub.OpenReader(filename)
-	if err != nil {
-		panic(err)
+	program := tea.NewProgram(initialModel, tea.WithAltScreen())
+	if _, err := program.Run(); err != nil {
+		fmt.Printf("There's been an error: %v", err)
+		os.Exit(1)
 	}
-	defer rc.Close()
+}
 
-	zip, err := zip2.OpenReader(filename)
-	if err != nil {
-		panic(err)
-	}
-	defer zip.Close()
+func (m model) Init() tea.Cmd {
+	return nil
+}
 
-	book := rc.Rootfiles[0]
-	fmt.Println(book.Title)
-
-	spine := book.Spine.Itemrefs
-	currentIndex := 0
-
-	reader := bufio.NewReader(os.Stdin)
-
-	for {
-		fmt.Print("\033[H\033[2J")
-
-		item := spine[currentIndex]
-
-		fmt.Printf("Chapter %d of %d (ID: %s)\n", currentIndex+1, len(spine), item.ID)
-
-		docStyle, textStyle, totalHeight, totalWidth := createReaderStyles()
-
-		fileName := findFileName(book, item.ID)
-
-		if fileName == "" {
-			handleEmptyText(docStyle, reader, &currentIndex, spine)
-			continue
+func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+		return m, nil
+	case tea.KeyMsg:
+		if msg.String() == "ctrl+c" {
+			return m, tea.Quit
 		}
 
-		fileStream, err := openZipFile(zip, fileName)
-		if err != nil {
-			handleNavigation(reader, &currentIndex, len(spine))
-			continue
+		if msg.String() == "q" && m.state == libraryView {
+			return m, tea.Quit
 		}
 
-		rawText := extractText(fileStream)
-		fileStream.Close()
-		formattedText := strings.ReplaceAll(rawText, "\t", "    ")
-
-		if strings.TrimSpace(rawText) == "" {
-			handleEmptyText(docStyle, reader, &currentIndex, spine)
-			continue
+		if m.state == libraryView {
+			return updateLibrary(m, msg)
 		} else {
-			viewChapter(totalHeight, totalWidth, textStyle, docStyle, formattedText, reader, &currentIndex, spine)
-		}
-
-		if currentIndex >= len(spine) {
-			currentIndex = len(spine) - 1
-		}
-		if currentIndex < 0 {
-			currentIndex = 0
+			return updateReader(m, msg)
 		}
 	}
-
+	return m, nil
 }
 
-func findFileName(book *epub.Rootfile, chapterId string) string {
-	for _, manifestItem := range book.Manifest.Items {
-		if manifestItem.ID == chapterId {
-			return manifestItem.HREF
-		}
-	}
-	return ""
-}
-
-func openZipFile(zipReader *zip2.ReadCloser, targetFileName string) (io.ReadCloser, error) {
-	for _, file := range zipReader.File {
-		if strings.HasSuffix(file.Name, targetFileName) {
-			return file.Open()
-		}
-	}
-	return nil, fmt.Errorf("file not found: %s", targetFileName)
-}
-
-func extractText(readableData io.Reader) string {
-	decoder := xml.NewDecoder(readableData)
-	var sb strings.Builder
-
-	for {
-		t, err := decoder.Token()
-		if err == io.EOF {
-			break
-		}
-
-		switch token := t.(type) {
-		case xml.StartElement:
-			if token.Name.Local == "p" || token.Name.Local == "div" ||
-				token.Name.Local == "br" || token.Name.Local == "h1" ||
-				token.Name.Local == "h2" || token.Name.Local == "li" {
-				sb.WriteString("\n\n")
-			}
-		case xml.CharData:
-			content := string(token)
-
-			sb.WriteString(content)
-		}
-	}
-	return sb.String()
-}
-
-func handleNavigation(reader *bufio.Reader, currentIndex *int, totalChapters int) {
-	fd := int(os.Stdin.Fd())
-
-	oldState, err := term.MakeRaw(fd)
-	if err != nil {
-		panic(err)
-	}
-	defer term.Restore(fd, oldState)
-
-	bytes := make([]byte, 1)
-	os.Stdin.Read(bytes)
-
-	switch bytes[0] {
-	case 'q':
-		term.Restore(fd, oldState)
-		os.Exit(0)
-		return
-	case 27:
-		sequence := make([]byte, 2)
-		os.Stdin.Read(sequence)
-		switch sequence[1] {
-		case 'C':
-			*currentIndex++
-		case 'D':
-			*currentIndex--
-		}
-	}
-	if *currentIndex >= totalChapters {
-		*currentIndex = totalChapters - 1
-	}
-	if *currentIndex < 0 {
-		*currentIndex = 0
-	}
-}
-
-func handleEmptyText(docStyle lipgloss.Style, reader *bufio.Reader, currentIndex *int, spine []epub.Itemref) {
-	fmt.Println("\n[This chapter contains no text (Image or Empty)]")
-	fmt.Println(docStyle.Render("\n[ Press (n) Next or (p) Prev ]"))
-	handleNavigation(reader, currentIndex, len(spine))
-}
-
-func createReaderStyles() (docStyle, textStyle lipgloss.Style, totalHeight, totalWidth int) {
-	totalWidth, totalHeight, err := term.GetSize(int(os.Stdout.Fd()))
-	if err != nil || totalWidth <= 0 {
-		totalWidth = 80
-		totalHeight = 64
-	}
-
-	docStyle = lipgloss.NewStyle().
-		Width(totalWidth).
-		Align(lipgloss.Center)
-
-	textStyle = lipgloss.NewStyle().
-		Width(min(80, totalWidth-10)).
-		Align(lipgloss.Left)
-
-	return docStyle, textStyle, totalHeight, totalWidth
-}
-
-func viewChapter(totalHeight, totalWidth int, textStyle, docStyle lipgloss.Style, formattedText string, reader *bufio.Reader, currentIndex *int, spine []epub.Itemref) {
-	fd := int(os.Stdin.Fd())
-
-	oldState, err := term.MakeRaw(fd)
-	if err != nil {
-		panic(err)
-	}
-	defer term.Restore(fd, oldState)
-
-	verticalMargin := 7
-	linesPerPage := totalHeight - verticalMargin
-	if linesPerPage < 1 {
-		linesPerPage = 1
-	}
-
-	textWidth := 80
-	if totalWidth-10 < 80 {
-		textWidth = totalWidth - 10
-	}
-	leftPadding := (totalWidth - textWidth) / 2
-	if leftPadding < 0 {
-		leftPadding = 0
-	}
-
-	pageStyle := lipgloss.NewStyle().Padding(1, 0, 1, leftPadding)
-
-	fullFormattedText := textStyle.Render(formattedText)
-	allLines := strings.Split(fullFormattedText, "\n")
-
-	totalLines := len(allLines)
-	totalPages := (totalLines + linesPerPage - 1) / linesPerPage
-
-	currentPage := 0
-
-	for {
-		startLine := currentPage * linesPerPage
-		endLine := startLine + linesPerPage
-		if endLine > totalLines {
-			endLine = totalLines
-		}
-
-		pageLines := allLines[startLine:endLine]
-
-		pageContent := strings.Join(pageLines, "\n")
-		pageContent = strings.TrimPrefix(pageContent, "\n")
-
-		fmt.Print("\033[H\033[2J")
-
-		output := pageStyle.Render(pageContent)
-		output = strings.ReplaceAll(output, "\n", "\r\n")
-		fmt.Print(output)
-
-		linesPrinted := endLine - startLine
-		if linesPrinted < linesPerPage {
-			fmt.Print(strings.Repeat("\r\n", linesPerPage-linesPrinted))
-		}
-
-		status := fmt.Sprintf("Page %d/%d | Chapter %d/%d", currentPage+1, totalPages, *currentIndex+1, len(spine))
-		statusRendered := docStyle.Render(status)
-		statusRendered = strings.ReplaceAll(statusRendered, "\n", "\r\n")
-		fmt.Print("\r\n" + statusRendered + "\r\n")
-		//footerText := "[ (n) Next Pg | (p) Prev Pg | (q) Quit ]"
-		//fmt.Println(docStyle.Render(footerText))
-
-		bytes := make([]byte, 1)
-		os.Stdin.Read(bytes)
-
-		switch bytes[0] {
-		case 'q':
-			term.Restore(fd, oldState)
-			os.Exit(0)
-			return
-		case 27:
-			sequence := make([]byte, 2)
-			os.Stdin.Read(sequence)
-			switch sequence[1] {
-			case 'C':
-				if currentPage < totalPages-1 {
-					currentPage++
-				} else {
-					*currentIndex++
-					return
-				}
-			case 'D':
-				if currentPage > 0 {
-					currentPage--
-				} else {
-					*currentIndex--
-					return
-				}
-			}
-		}
+func (m model) View() string {
+	if m.state == libraryView {
+		return viewLibrary(m)
+	} else {
+		return viewReader(m)
 	}
 }
